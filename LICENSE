@@ -2,7 +2,7 @@ Custom License for Budget Tracker
 
 Copyright (c) 2025 John Marc Gonzales
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software (the "Software"), to use, copy, modify, merge, publish, and distribute copies of the Software, subject to the following conditions:
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software (the "Software"), to use, copy, modify, merge, publish, and distribute copies of the Software, subject to the following conditions (third‑party optional dependencies such as matplotlib and openpyxl retain their own respective licenses):
 
 1. The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 2. Any public use, fork, derivative, or distribution must provide clear attribution to the original Author: "John Marc Gonzales".

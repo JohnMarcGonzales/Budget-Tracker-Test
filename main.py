@@ -3,15 +3,21 @@
 Compact Budget Tracker
 Author: John Marc Gonzales (c) 2025
 
+Version 1.1.0
+
 Features:
  - USD & PHP currency support (simple adjustable rate)
  - Light/Dark soft red themed UI (toggle)
+ - Modernized responsive layout (cards, paned window, dynamic resizing)
  - Track income & expenses with categories
+ - Edit existing transactions
+ - Custom date range & live search / category / type filters
+ - Import CSV (date,type,category,description,amount,currency)
  - Monthly category budgets; shows Remaining & Over/Under
  - Visualizations (Matplotlib):
      * Spending over current month (line)
      * Expenses by category (pie)
-     * Income vs Expenses (bar)
+     * Income vs expenses (bar)
  - Quick Add pop-up
  - Transaction Templates (save/apply)
  - Export to CSV / Excel (.xlsx) without heavy deps (openpyxl optional)
@@ -20,25 +26,40 @@ Features:
  - Data persisted to JSON (transactions, budgets, settings, templates)
 
 Notes:
- - Keep code compact; some compromises on separation of concerns.
+ - Kept code compact; some compromises on separation of concerns.
  - For larger apps, split into modules & add proper MVC structure.
 """
-import json, os, csv, datetime as dt, threading
+import os
+import json
+import csv
+import datetime as dt
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional
+from typing import List, Optional, Dict
+from math import fsum
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from math import fsum
 
-# Matplotlib embedding
-try:
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-except Exception as e:  # Fallback placeholder
-    Figure = None
+# -------- Optional Dependencies (Charts / Excel) --------
+# Matplotlib is optional; if missing, charts tab will show a notice instead of crashing.
+try:  # pragma: no cover
+    from matplotlib.figure import Figure  # type: ignore
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # type: ignore
+except Exception:  # ImportError or backend issues
+    Figure = None  # Fallback flag
+
+# openpyxl is optional (Excel export). We import guardedly so editors won't error out;
+# if missing, Excel option is hidden. Install with: pip install openpyxl
+try:  # pragma: no cover
+    from openpyxl import Workbook  # type: ignore
+    HAS_OPENPYXL = True
+except Exception:  # ImportError
+    HAS_OPENPYXL = False
+    Workbook = None  # type: ignore
 
 DATA_FILE = 'data.json'
-VERSION = '1.0.0'
+VERSION = '1.1.0'
+# Global data container (loaded at runtime); initialized to satisfy linters
+data: Dict = {}
 
 # ---------------- Data Models -----------------
 @dataclass
@@ -123,7 +144,8 @@ def currency_symbol() -> str:
 
 # --------------- Core Logic -----------------
 
-def current_month_filter(tr: Transaction) -> bool:
+def current_month_filter(tr: Dict) -> bool:
+    """Return True if transaction dict is in current month."""
     d = dt.date.fromisoformat(tr['date'])
     today = dt.date.today()
     return d.year == today.year and d.month == today.month
@@ -177,10 +199,13 @@ def remaining_budget(category: Optional[str]=None):
 class BudgetApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        # Window basics
         self.title('Budget Tracker - John Marc Gonzales')
-        self.geometry('1100x700')
-        self.minsize(1000,650)
+        self.geometry('1250x760')
+        self.minsize(1100,700)
+        # Style object
         self.style = ttk.Style(self)
+        # Build UI and initialize
         self._build_ui()
         self.apply_theme()
         self.refresh_all()
@@ -205,52 +230,112 @@ class BudgetApp(tk.Tk):
     # ---- Build UI ----
     def _build_ui(self):
         self.dynamic_labels = []
-        self.top_bar = tk.Frame(self)
-        self.top_bar.pack(fill='x')
-        self.left_panel = tk.Frame(self)
-        self.left_panel.pack(side='left', fill='y')
-        self.main_panel = tk.Frame(self)
-        self.main_panel.pack(side='left', fill='both', expand=True)
-        self.stats_bar = tk.Frame(self)
-        self.stats_bar.pack(fill='x')
+        self.grid_rowconfigure(2, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+        # Top bar
+        self.top_bar = tk.Frame(self, height=46)
+        self.top_bar.grid(row=0, column=0, sticky='ew')
+        self.top_bar.grid_columnconfigure(50, weight=1)
+        # Filter bar
+        self.filter_bar = tk.Frame(self, height=40)
+        self.filter_bar.grid(row=1, column=0, sticky='ew')
+        self.filter_bar.grid_columnconfigure(30, weight=1)
+        # Paned central area
+        self.paned = tk.PanedWindow(self, orient='horizontal', sashrelief='raised', sashwidth=6, opaqueresize=False)
+        self.paned.grid(row=2, column=0, sticky='nsew')
+        self.left_panel = tk.Frame(self.paned)
+        self.main_panel = tk.Frame(self.paned)
+        self.paned.add(self.left_panel, stretch='always', minsize=500)
+        self.paned.add(self.main_panel, stretch='always')
+        # Status / stats bar
+        self.stats_bar = tk.Frame(self, height=32)
+        self.stats_bar.grid(row=3, column=0, sticky='ew')
 
-        # Top bar controls
-        tk.Button(self.top_bar, text='Add', command=self.open_add).pack(side='left', padx=4, pady=4)
-        tk.Button(self.top_bar, text='Quick Add', command=lambda: self.open_add(quick=True)).pack(side='left', padx=4)
-        tk.Button(self.top_bar, text='Templates', command=self.open_templates).pack(side='left', padx=4)
-        tk.Button(self.top_bar, text='Budgets', command=self.open_budgets).pack(side='left', padx=4)
-        tk.Button(self.top_bar, text='Charts', command=self.open_charts).pack(side='left', padx=4)
-        tk.Button(self.top_bar, text='Export', command=self.export_data).pack(side='left', padx=4)
-        tk.Button(self.top_bar, text='Settings', command=self.open_settings).pack(side='left', padx=4)
-        tk.Button(self.top_bar, text='Theme', command=self.toggle_theme).pack(side='left', padx=4)
-        tk.Label(self.top_bar, text='Currency:').pack(side='left')
+        # Top bar controls (grouped for clarity)
+        def tb_btn(txt, cmd):
+            return tk.Button(self.top_bar, text=txt, command=cmd, cursor='hand2')
+        tb_btn('Add', self.open_add).grid(row=0, column=0, padx=3, pady=4)
+        tb_btn('Quick', lambda: self.open_add(quick=True)).grid(row=0, column=1, padx=3)
+        tb_btn('Edit', self.edit_selected).grid(row=0, column=2, padx=3)
+        tb_btn('Delete', self.delete_selected).grid(row=0, column=3, padx=3)
+        tb_btn('Templates', self.open_templates).grid(row=0, column=4, padx=3)
+        tb_btn('Budgets', self.open_budgets).grid(row=0, column=5, padx=3)
+        tb_btn('Charts', self.open_charts).grid(row=0, column=6, padx=3)
+        tb_btn('Import', self.import_csv).grid(row=0, column=7, padx=3)
+        tb_btn('Export', self.export_data).grid(row=0, column=8, padx=3)
+        tb_btn('Settings', self.open_settings).grid(row=0, column=9, padx=3)
+        tb_btn('Theme', self.toggle_theme).grid(row=0, column=10, padx=3)
+        tk.Label(self.top_bar, text='Currency:').grid(row=0, column=11, padx=(15,2))
         self.currency_var = tk.StringVar(value=data['settings']['display_currency'])
-        tk.OptionMenu(self.top_bar, self.currency_var, 'USD','PHP', command=self.change_currency).pack(side='left')
-        tk.Label(self.top_bar, text='v'+VERSION).pack(side='right', padx=8)
+        tk.OptionMenu(self.top_bar, self.currency_var, 'USD','PHP', command=self.change_currency).grid(row=0, column=12, padx=2)
+        tk.Label(self.top_bar, text='v'+VERSION).grid(row=0, column=13, padx=12)
 
-        # Left panel: Transactions list
-        self.tr_tree = ttk.Treeview(self.left_panel, columns=('date','type','cat','desc','amt'), show='headings', height=25)
-        for c, w in [('date',90),('type',60),('cat',100),('desc',150),('amt',90)]:
-            self.tr_tree.heading(c, text=c.title())
-            self.tr_tree.column(c, width=w, anchor='w')
-        self.tr_tree.pack(fill='both', expand=True, padx=4, pady=4)
-        tk.Button(self.left_panel, text='Delete Selected', command=self.delete_selected).pack(fill='x', padx=4, pady=2)
+        # Filter bar inputs
+        self.start_date_var = tk.StringVar(); self.end_date_var = tk.StringVar(); self.search_var = tk.StringVar();
+        self.filter_type_var = tk.StringVar(value='All')
+        self.filter_category_var = tk.StringVar(value='All')
+        def fb_label(txt, col): tk.Label(self.filter_bar, text=txt).grid(row=0, column=col, padx=2)
+        fb_label('Start',0); tk.Entry(self.filter_bar, textvariable=self.start_date_var, width=10).grid(row=0, column=1)
+        fb_label('End',2); tk.Entry(self.filter_bar, textvariable=self.end_date_var, width=10).grid(row=0, column=3)
+        fb_label('Type',4); ttk.Combobox(self.filter_bar, textvariable=self.filter_type_var, values=['All','income','expense'], width=8, state='readonly').grid(row=0, column=5)
+        fb_label('Category',6); self.category_combo = ttk.Combobox(self.filter_bar, textvariable=self.filter_category_var, values=['All'], width=14, state='readonly'); self.category_combo.grid(row=0, column=7)
+        fb_label('Search',8); tk.Entry(self.filter_bar, textvariable=self.search_var, width=18).grid(row=0, column=9, sticky='ew')
+        tk.Button(self.filter_bar, text='Apply', command=self.refresh_transactions).grid(row=0, column=10, padx=4)
+        tk.Button(self.filter_bar, text='Clear', command=self.clear_filters).grid(row=0, column=11, padx=2)
+        self.search_var.trace_add('write', lambda *_: self.refresh_transactions())
 
-        # Main panel: Overview labels placeholder
+        # Left panel: Transactions list with scrollbars
+        list_container = tk.Frame(self.left_panel)
+        list_container.pack(fill='both', expand=True, padx=4, pady=(4,2))
+        cols = ('id','date','type','cat','desc','amt')
+        self.tr_tree = ttk.Treeview(list_container, columns=cols, show='headings')
+        headings = {'id':'ID','date':'Date','type':'Type','cat':'Category','desc':'Description','amt':'Amount'}
+        widths = {'id':40,'date':90,'type':70,'cat':120,'desc':260,'amt':110}
+        for c in cols:
+            self.tr_tree.heading(c, text=headings[c])
+            self.tr_tree.column(c, width=widths[c], anchor='w', stretch=(c!='id'))
+        vsb = ttk.Scrollbar(list_container, orient='vertical', command=self.tr_tree.yview)
+        hsb = ttk.Scrollbar(list_container, orient='horizontal', command=self.tr_tree.xview)
+        self.tr_tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+        self.tr_tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
+        list_container.grid_rowconfigure(0, weight=1)
+        list_container.grid_columnconfigure(0, weight=1)
+        # Main panel: Overview cards
+        self.main_panel.grid_rowconfigure(3, weight=1)
+        self.main_panel.grid_columnconfigure(0, weight=1)
         self.overview_frame = tk.Frame(self.main_panel)
-        self.overview_frame.pack(fill='both', expand=True)
-        self.income_lbl = self._dyn_label(self.overview_frame)
-        self.expense_lbl = self._dyn_label(self.overview_frame)
-        self.remaining_lbl = tk.Label(self.overview_frame, font=('Arial', 18,'bold'))
-        self.remaining_lbl.pack(pady=10)
-        self.budget_summary = self._dyn_label(self.overview_frame)
-        tk.Label(self.overview_frame, text='(c) John Marc Gonzales', font=('Arial',9,'italic')).pack(side='bottom', pady=4)
+        self.overview_frame.grid(row=0, column=0, sticky='ew', padx=6, pady=6)
+        # Cards
+        self.cards_frame = tk.Frame(self.main_panel)
+        self.cards_frame.grid(row=1, column=0, sticky='ew', padx=6)
+        self.cards_frame.grid_columnconfigure((0,1,2), weight=1)
+        self.income_lbl = self._card(self.cards_frame, 'Income')
+        self.expense_lbl = self._card(self.cards_frame, 'Expenses', col=1)
+        self.remaining_lbl = self._card(self.cards_frame, 'Remaining Budget', col=2, big=True)
+        # Budget summary expansive
+        self.budget_summary = tk.Label(self.main_panel, font=('Arial', 11), anchor='w', wraplength=560, justify='left')
+        self.budget_summary.grid(row=2, column=0, sticky='ew', padx=10, pady=(4,2))
+        tk.Label(self.main_panel, text='(c) John Marc Gonzales', font=('Arial',9,'italic')).grid(row=4, column=0, pady=4, sticky='e')
 
     def _dyn_label(self, parent):
         lbl = tk.Label(parent, font=('Arial', 12))
         lbl.pack(pady=4)
         self.dynamic_labels.append(lbl)
         return lbl
+
+    def _card(self, parent, title, col=0, big=False):
+        frame = tk.Frame(parent, bd=0, highlightthickness=0, padx=12, pady=10)
+        frame.grid(row=0, column=col, sticky='nsew', padx=5, pady=4)
+        parent.grid_columnconfigure(col, weight=1)
+        title_lbl = tk.Label(frame, text=title, font=('Arial',10,'bold'))
+        title_lbl.pack(anchor='w')
+        val_lbl = tk.Label(frame, font=('Arial', 20 if big else 16,'bold'))
+        val_lbl.pack(anchor='w')
+        self.dynamic_labels.append(title_lbl)
+        self.dynamic_labels.append(val_lbl)
+        return val_lbl
 
     # ---- Data Refresh ----
     def refresh_all(self):
@@ -261,17 +346,20 @@ class BudgetApp(tk.Tk):
         for i in self.tr_tree.get_children():
             self.tr_tree.delete(i)
         sym = currency_symbol()
-        for t in reversed(list_transactions()[-400:]):  # show last 400
+        filtered = self.apply_filters(list_transactions())
+        # update category combo values
+        cats = sorted(set(t['category'] for t in list_transactions()))
+        self.category_combo.configure(values=['All']+cats)
+        for t in reversed(filtered[-800:]):  # show last 800 filtered
             disp_amt = convert_from_base(t['amount_base'])
-            self.tr_tree.insert('', 'end', values=(t['date'], t['ttype'], t['category'], t['description'], f"{sym}{disp_amt:,.2f}"))
+            self.tr_tree.insert('', 'end', values=(t['id'], t['date'], t['ttype'], t['category'], t['description'], f"{sym}{disp_amt:,.2f}"))
 
     def refresh_overview(self):
         inc, exp = monthly_totals()
         sym = currency_symbol()
         self.income_lbl.config(text=f"Monthly Income: {sym}{convert_from_base(inc):,.2f}")
         self.expense_lbl.config(text=f"Monthly Expenses: {sym}{convert_from_base(exp):,.2f}")
-        rem = remaining_budget()
-        self.remaining_lbl.config(text=f"Remaining Total Budget: {sym}{convert_from_base(rem):,.2f}")
+        rem = remaining_budget(); self.remaining_lbl.config(text=f"{sym}{convert_from_base(rem):,.2f}")
         # Category status text
         parts = []
         for cat, bud in data['budgets'].items():
@@ -441,13 +529,54 @@ class BudgetApp(tk.Tk):
         sel = self.tr_tree.selection()
         if not sel: return
         if not messagebox.askyesno('Confirm','Delete selected transaction?'): return
-        idx_disp = self.tr_tree.index(sel[0])
-        # Convert displayed index (reversed) to actual index
-        actual_list = list_transactions()[-400:]
-        actual = actual_list[::-1][idx_disp]
-        # Remove by id
-        data['transactions'] = [t for t in data['transactions'] if t['id'] != actual['id']]
+        # Retrieve id directly from tree values
+        tr_id = int(self.tr_tree.item(sel[0])['values'][0])
+        data['transactions'] = [t for t in data['transactions'] if t['id'] != tr_id]
         save_data(); self.refresh_all()
+
+    def edit_selected(self):
+        sel = self.tr_tree.selection()
+        if not sel: return
+        tr_id = int(self.tr_tree.item(sel[0])['values'][0])
+        tr = next((t for t in data['transactions'] if t['id']==tr_id), None)
+        if not tr: return
+        win = tk.Toplevel(self); win.title('Edit Transaction'); win.geometry('340x370')
+        entries = {}
+        def add_field(label, default=''):
+            tk.Label(win, text=label).pack()
+            var = tk.StringVar(value=default)
+            ent = tk.Entry(win, textvariable=var); ent.pack(fill='x', padx=6)
+            entries[label]=var
+        add_field('Description', tr['description'])
+        add_field('Category', tr['category'])
+        add_field('Amount', str(tr['amount_orig']))
+        tk.Label(win, text='Type').pack(); ttype_var = tk.StringVar(value=tr['ttype'])
+        ttk.Combobox(win, textvariable=ttype_var, values=['expense','income']).pack(fill='x', padx=6)
+        tk.Label(win, text='Currency').pack(); cur_var = tk.StringVar(value=tr['currency'])
+        ttk.Combobox(win, textvariable=cur_var, values=['USD','PHP']).pack(fill='x', padx=6)
+        tk.Label(win, text='Date (YYYY-MM-DD)').pack(); date_var = tk.StringVar(value=tr['date'])
+        tk.Entry(win, textvariable=date_var).pack(fill='x', padx=6)
+        def submit():
+            # Validate amount
+            try:
+                amt = float(entries['Amount'].get())
+            except Exception:
+                return messagebox.showerror('Error','Invalid amount')
+            # Update fields
+            tr['description'] = entries['Description'].get()
+            tr['category'] = entries['Category'].get()
+            tr['ttype'] = ttype_var.get()
+            tr['currency'] = cur_var.get()
+            tr['amount_orig'] = amt
+            tr['amount_base'] = round(convert_to_base(amt, cur_var.get()),2)
+            # Date
+            try:
+                dt.date.fromisoformat(date_var.get())
+                tr['date'] = date_var.get()
+            except Exception:
+                pass
+            save_data(); self.refresh_all(); win.destroy()
+        tk.Button(win, text='Save Changes', command=submit).pack(pady=10)
 
     # ---- Reminders ----
     def schedule_reminder_check(self):
@@ -474,7 +603,10 @@ class BudgetApp(tk.Tk):
 
     # ---- Export ----
     def export_data(self):
-        path = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=[('CSV','*.csv'),('Excel','*.xlsx')])
+        filetypes = [('CSV','*.csv')]
+        if HAS_OPENPYXL:
+            filetypes.append(('Excel','*.xlsx'))
+        path = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=filetypes)
         if not path: return
         if path.lower().endswith('.csv'):
             with open(path,'w',newline='',encoding='utf-8') as f:
@@ -484,14 +616,79 @@ class BudgetApp(tk.Tk):
                     w.writerow([t['id'], t['date'], t['ttype'], t['category'], t['description'], t['amount_base'], t['amount_orig'], t['currency']])
             messagebox.showinfo('Export','CSV exported.')
         else:
-            try:
-                from openpyxl import Workbook
-            except ImportError:
-                return messagebox.showerror('Missing','Install openpyxl for Excel export.')
+            if not HAS_OPENPYXL:
+                return messagebox.showerror('Missing','Install openpyxl for Excel export (pip install openpyxl).')
             wb = Workbook(); ws = wb.active; ws.append(['ID','Date','Type','Category','Description','Amount Base (USD)','Orig Amount','Orig Currency'])
             for t in data['transactions']:
                 ws.append([t['id'], t['date'], t['ttype'], t['category'], t['description'], t['amount_base'], t['amount_orig'], t['currency']])
             wb.save(path); messagebox.showinfo('Export','Excel exported.')
+
+    # ---- Import ----
+    def import_csv(self):
+        path = filedialog.askopenfilename(filetypes=[('CSV','*.csv')])
+        if not path: return
+        imported = 0
+        with open(path, newline='', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    date = row.get('date') or dt.date.today().isoformat()
+                    # accept date; if invalid skip
+                    try: dt.date.fromisoformat(date)
+                    except: continue
+                    ttype = row.get('type','expense').lower()
+                    if ttype not in ('income','expense'): continue
+                    cat = row.get('category','General')
+                    desc = row.get('description','')
+                    cur = row.get('currency','USD').upper()
+                    amt_raw = row.get('amount') or row.get('amount_orig') or ''
+                    base_raw = row.get('amount_base') or row.get('amount_base(USD)') or ''
+                    if amt_raw:
+                        amt = float(amt_raw)
+                        base = convert_to_base(amt, cur)
+                    elif base_raw:
+                        base = float(base_raw); amt = base if cur=='USD' else base*data['settings']['php_rate']
+                    else:
+                        continue
+                    tid = data['next_id']; data['next_id']+=1
+                    data['transactions'].append({
+                        'id':tid,'date':date,'ttype':ttype,'category':cat,'description':desc,
+                        'amount_base':round(base,2),'currency':cur,'amount_orig':amt
+                    })
+                    imported +=1
+                except Exception:
+                    continue
+        save_data(); self.refresh_all(); messagebox.showinfo('Import', f'Imported {imported} transactions.')
+
+    # ---- Filters ----
+    def clear_filters(self):
+        self.start_date_var.set(''); self.end_date_var.set(''); self.search_var.set(''); self.filter_type_var.set('All'); self.filter_category_var.set('All'); self.refresh_transactions()
+
+    def apply_filters(self, items):
+        sd = self.start_date_var.get().strip(); ed = self.end_date_var.get().strip()
+        search = self.search_var.get().strip().lower()
+        ftype = self.filter_type_var.get()
+        fcat = self.filter_category_var.get()
+        def date_ok(tdate):
+            try: d = dt.date.fromisoformat(tdate)
+            except: return True
+            if sd:
+                try: sdd = dt.date.fromisoformat(sd)
+                except: sdd=None
+                if sdd and d < sdd: return False
+            if ed:
+                try: edd = dt.date.fromisoformat(ed)
+                except: edd=None
+                if edd and d > edd: return False
+            return True
+        out = []
+        for t in items:
+            if ftype!='All' and t['ttype']!=ftype: continue
+            if fcat!='All' and t['category']!=fcat: continue
+            if search and search not in (t['description'] or '').lower() and search not in t['category'].lower(): continue
+            if not date_ok(t['date']): continue
+            out.append(t)
+        return out
 
 # --------------- Main ---------------
 if __name__ == '__main__':

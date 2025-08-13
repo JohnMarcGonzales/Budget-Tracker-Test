@@ -1,0 +1,10 @@
+# Budget Tracker dependencies
+# Core application relies only on the Python standard library (tkinter, json, csv, etc.).
+# The packages below are OPTIONAL but recommended for full functionality.
+# Install all optional features:
+#   pip install -r requirements.txt
+
+# Charts (visualizations)
+matplotlib>=3.7.0
+# Excel export (.xlsx)
+openpyxl>=3.1.0

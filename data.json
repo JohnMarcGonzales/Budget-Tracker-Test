@@ -1,0 +1,15 @@
+{
+  "transactions": [],
+  "next_id": 1,
+  "budgets": {},
+  "settings": {
+    "base_currency": "USD",
+    "display_currency": "USD",
+    "php_rate": 58.0,
+    "theme": "light",
+    "daily_reminder_time": "21:00",
+    "weekly_reminder_day": "Sun",
+    "weekly_reminder_time": "21:00"
+  },
+  "templates": []
+}
